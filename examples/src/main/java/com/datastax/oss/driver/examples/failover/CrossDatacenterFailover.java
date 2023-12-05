@@ -31,14 +31,13 @@ import com.datastax.oss.driver.api.core.servererrors.CoordinatorException;
 import com.datastax.oss.driver.api.core.servererrors.QueryConsistencyException;
 import com.datastax.oss.driver.api.core.servererrors.UnavailableException;
 import com.datastax.oss.driver.internal.core.util.concurrent.CompletableFutures;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.nio.file.Files;
+
 import java.nio.file.Paths;
-import java.util.List;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.Objects;
-import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
@@ -95,15 +94,12 @@ public class CrossDatacenterFailover {
 
     CrossDatacenterFailover client = new CrossDatacenterFailover();
 
-    // For testing, use system property -Dnum_writes=N to set number of writes that will be executed
-    // Defaults to one write
-    int numberOfWrites = Integer.parseInt(System.getProperty("num_writes", "1"));
-
     try {
 
       // Note: when this example is executed, at least the local DC must be available
       // since the driver will try to reach contact points in that DC.
 
+      client.createConfig();
       client.connect();
       client.createSchema();
 
@@ -119,92 +115,101 @@ public class CrossDatacenterFailover {
                       + "'2018-02-26T13:53:46.345+01:00',"
                       + "2.34)");
 
+      int numberOfWrites = Integer.parseInt(client.config.get("num_writes"));
       for (int i = 0; i < numberOfWrites; i++) {
 
         //client.writeSync(statement);
         client.writeAsync(statement, i);
       }
 
+    } catch (Throwable e) {
+      throw new RuntimeException(e);
     } finally {
       client.close();
     }
   }
 
+  private Logger logger;
   private CqlSession primarySession;
   private CqlSession secondarySession;
+  private Map<String, String> config;
 
   private CrossDatacenterFailover() {
+    logger = LoggerFactory.getLogger(CrossDatacenterFailover.class);
+  }
+
+  private void createConfig() {
+
+    config = new HashMap<>();
+    config.put("primarySCB", System.getProperty("primarySCB", null));
+    config.put("secondarySCB", System.getProperty("secondarySCB", null));
+    config.put("keyspace", System.getProperty("keyspace", null));
+    config.put("user", System.getProperty("user", null));
+    config.put("password", System.getProperty("password", null));
+    // For testing
+    config.put("num_writes", System.getProperty("num_writes", "1"));
+
+    StringBuilder missing = new StringBuilder();
+    for (Map.Entry<String, String> entry : config.entrySet()) {
+      if (entry.getValue() == null) {
+        missing.append("-D").append(entry.getKey()).append(", ");
+      }
+    }
+
+    if (missing.length() > 0) {
+      System.out.println("The following properties are missing: " + missing);
+      System.exit(1);
+    }
+  }
+
+  private CqlSession createSession(String scb) {
+    return CqlSession.builder()
+            .withCloudSecureConnectBundle(Paths.get(scb))
+            .withAuthCredentials(config.get("user"), config.get("password"))
+            .withKeyspace(config.get("keyspace"))
+            .build();
   }
 
   /**
    * Initiates a connection to the cluster.
    */
   private void connect() {
-    // Load "astra.properties"
-    String rootPath = Paths.get(CrossDatacenterFailover.class.getProtectionDomain().getCodeSource().getLocation().getPath()).getParent().toString() + "/";
-    String astraConfigPath = rootPath + "astra.properties";
-
-    Properties astraProp = new Properties();
-    try {
-
-      astraProp.load(Files.newInputStream(Paths.get(astraConfigPath)));
-
-    } catch (IOException e) {
-
-      System.out.println("Configuration file 'astra.properties' is missing or invalid.");
-      e.printStackTrace();
-    }
-
-    // Configure these properties in "astra.properties"
-    String primarySecureConnectBundle = astraProp.getProperty("primary_secure_connect_bundle");
-    String secondarySecureConnectBundle = astraProp.getProperty("secondary_secure_connect_bundle");
-    String keyspace = astraProp.getProperty("keyspace");
-
-    // Get credentials from system properties
-    String clientId = System.getProperty("astra_user", null);
-    String clientSecret = System.getProperty("astra_password", null);
-
-    if (clientId == null || clientSecret == null) {
-
-      System.out.println("Astra credentials are missing. Use system properties -Dastra_user=<username> -Dastra_password=<password>");
-      System.exit(1);
-    }
 
     try {
 
-      primarySession = CqlSession.builder()
-              .withCloudSecureConnectBundle(Paths.get(primarySecureConnectBundle))
-              .withAuthCredentials(clientId, clientSecret)
-              .withKeyspace(keyspace)
-              .build();
-
-      System.out.println("Connected to cluster with session: " + primarySession.getName());
+      primarySession = createSession(config.get("primarySCB"));
+      String msg = "Connected to cluster with session: " + primarySession.getName();
+      logger.info(msg);
+      //System.out.println(msg);
 
     } catch (AllNodesFailedException | IllegalStateException e) {
 
-      System.out.println("Error connecting to primary session: " + e);
+      String msg = "Error connecting to primary session: " + e;
+      logger.error(msg);
+      //System.out.println(msg);
       primarySession = null;
     }
 
     try {
 
-      secondarySession = CqlSession.builder()
-              .withCloudSecureConnectBundle(Paths.get(secondarySecureConnectBundle))
-              .withAuthCredentials(clientId, clientSecret)
-              .withKeyspace(keyspace)
-              .build();
-
-      System.out.println("Connected to cluster with session: " + secondarySession.getName());
+      secondarySession = createSession(config.get("secondarySCB"));
+      String msg = "Connected to cluster with session: " + secondarySession.getName();
+      logger.info(msg);
+      //System.out.println(msg);
 
     } catch (AllNodesFailedException | IllegalStateException e) {
 
-      System.out.println("Error connecting to secondary session: " + e);
+      String msg = "Error connecting to secondary session: " + e;
+      logger.error(msg);
+      //System.out.println(msg);
       secondarySession = null;
     }
 
     if (primarySession == null && secondarySession == null) {
 
-      System.out.println("Unable to connect to any session");
+      String msg = "Unable to connect to any session, exiting...";
+      logger.error(msg);
+      //System.out.println(msg);
       System.exit(1);
     }
   }
@@ -214,34 +219,33 @@ public class CrossDatacenterFailover {
    */
   private void createSchema() {
 
+    String statement = "CREATE TABLE IF NOT EXISTS testks.orders ("
+            + "product_id uuid,"
+            + "timestamp timestamp,"
+            + "price double,"
+            + "PRIMARY KEY (product_id,timestamp)"
+            + ")";
+
     try {
 
-      primarySession.execute(
-              "CREATE TABLE IF NOT EXISTS testks.orders ("
-                      + "product_id uuid,"
-                      + "timestamp timestamp,"
-                      + "price double,"
-                      + "PRIMARY KEY (product_id,timestamp)"
-                      + ")");
+      primarySession.execute(statement);
 
     } catch (Exception e) {
 
-      System.out.println("Error creating schema, retrying with remote DC");
+      String msgPrimary = "Error creating schema, retrying with remote DC";
+      logger.warn(msgPrimary);
+      //System.out.println(msgPrimary);
 
       try {
 
-        secondarySession.execute(
-                "CREATE TABLE IF NOT EXISTS testks.orders ("
-                        + "product_id uuid,"
-                        + "timestamp timestamp,"
-                        + "price double,"
-                        + "PRIMARY KEY (product_id,timestamp)"
-                        + ")");
+        secondarySession.execute(statement);
 
       } catch (Exception e2) {
 
-        System.out.println("Error creating schema in remote DC");
-        e2.printStackTrace();
+        String msgSecondary = "Error creating schema in remote DC";
+        logger.error(msgSecondary, e2);
+        //System.out.println(msgSecondary);
+        //e2.printStackTrace();
       }
 
     }
@@ -252,33 +256,40 @@ public class CrossDatacenterFailover {
    */
   private void writeSync(Statement<?> statement) {
 
-    System.out.println("------- DC failover (sync) ------- ");
+    //System.out.println("------- DC failover (sync) ------- ");
 
     try {
 
       // try the statement using the default profile, which targets the local datacenter.
       primarySession.execute(statement);
 
-      System.out.println("Write to local DC succeeded");
+      String msgLocalSuccess = "Write to local DC succeeded";
+      logger.debug(msgLocalSuccess);
+      //System.out.println(msgLocalSuccess);
 
     } catch (DriverException e) {
 
       if (shouldFailover(e)) {
 
-        System.out.println("Write failed in local DC, retrying in remote DC");
+        String msgLocalFail = "Write failed in local DC, retrying in remote DC";
+        logger.warn(msgLocalFail);
+        //System.out.println(msgLocalFail);
 
         try {
 
           // try the statement using the secondary session, which targets the remote datacenter.
           secondarySession.execute(statement);
 
-          System.out.println("Write to remote DC succeeded");
+          String msgRemoteSuccess = "Write to remote DC succeeded";
+          logger.debug(msgRemoteSuccess);
+          //System.out.println(msgRemoteSuccess);
 
         } catch (DriverException e2) {
 
-          System.out.println("Write failed in remote DC");
-
-          e2.printStackTrace();
+          String msgRemoteFail = "Write failed in remote DC";
+          logger.error(msgRemoteFail, e2);
+          //System.out.println(msgRemoteFail);
+          //e2.printStackTrace();
         }
       }
     }
@@ -288,7 +299,7 @@ public class CrossDatacenterFailover {
   /**
    * Inserts data asynchronously using the local DC, retrying if necessary in a remote DC.
    */
-  private void writeAsync(Statement<?> statement, int iteratorCount) throws ExecutionException, InterruptedException {
+  private void writeAsync(Statement<?> statement, int iteratorCount) throws Throwable {
 
     //System.out.println("------- DC failover (async) ------- ");
 
@@ -306,7 +317,9 @@ public class CrossDatacenterFailover {
                                 } else {
                                   if (error instanceof DriverException
                                           && shouldFailover((DriverException) error)) {
-                                    System.out.println("Write failed in local DC, retrying in remote DC");
+                                    String msg = "Write failed in local DC, retrying in remote DC";
+                                    logger.warn(msg);
+                                    //System.out.println(msg);
                                     // try the statement using the secondary session, which targets the remote
                                     // datacenter.
                                     return secondarySession.executeAsync(statement);
@@ -321,51 +334,38 @@ public class CrossDatacenterFailover {
                               (rs, error) -> {
                                 if (error == null) {
                                   if (iteratorCount % 100 == 0) {
-                                    System.out.println("Write succeeded");
+                                    String msg = "Write succeeded";
+                                    logger.debug(msg);
+                                    //System.out.println(msg);
                                   }
                                 } else {
-                                  System.out.println("Write failed in remote DC");
-                                  error.printStackTrace();
+                                  String msg = "Write failed in remote DC";
+                                  logger.error(msg, error);
+                                  //System.out.println(msg);
+                                  //error.printStackTrace();
                                   // DEBUGGING - TODO - REMOVE
-                                  if (error instanceof HeartbeatException) {
-                                    HeartbeatException heartbeatException = (HeartbeatException) error;
-                                    String coordinator = Objects.requireNonNull(heartbeatException.getExecutionInfo().getCoordinator()).getEndPoint().toString();
-                                    System.out.println("Coordinator: " + coordinator);
-                                  }
+                                  logHeartbeatError(error);
                                 }
                               });
     } else {
       result =
               secondarySession
                       .executeAsync(statement)
-                      .handle(
-                              (rs, error) -> {
-                                System.out.println("Primary session is null, attempted write to remote DC");
-                                if (error == null) {
-                                  return CompletableFuture.completedFuture(rs);
-                                } else {
-                                  System.out.println("Primary session is null, write failed in remote DC during handle");
-                                  // let other errors propagate
-                                  return CompletableFutures.<AsyncResultSet>failedFuture(error);
-                                }
-                              })
-                      // unwrap (flatmap) the nested future
-                      .thenCompose(future -> future)
                       .whenComplete(
                               (rs, error) -> {
                                 if (error == null) {
                                   if (iteratorCount % 100 == 0) {
-                                    System.out.println("Write succeeded");
+                                    String msg = "Write succeeded";
+                                    logger.debug(msg);
+                                    //System.out.println(msg);
                                   }
                                 } else {
-                                  System.out.println("Primary session is null, write failed in remote DC during whenComplete");
-                                  error.printStackTrace();
+                                  String msg = "Primary session is null, write failed in remote DC";
+                                  logger.error(msg, error);
+                                  //System.out.println(msg);
+                                  //error.printStackTrace();
                                   // DEBUGGING - TODO - REMOVE
-                                  if (error instanceof HeartbeatException) {
-                                    HeartbeatException heartbeatException = (HeartbeatException) error;
-                                    String coordinator = Objects.requireNonNull(heartbeatException.getExecutionInfo().getCoordinator()).getEndPoint().toString();
-                                    System.out.println("Coordinator: " + coordinator);
-                                  }
+                                  logHeartbeatError(error);
                                 }
                               });
     }
@@ -373,17 +373,22 @@ public class CrossDatacenterFailover {
     // for the sake of this example, wait for the operation to finish
     try {
       result.toCompletableFuture().get();
-    } catch (Exception e) {
-      System.out.println("Exception occurred when retrieving future: " + e);
-      // DEBUGGING - TODO - REMOVE
-      if (e instanceof ExecutionException) {
-        Throwable cause = e.getCause();
-        if (cause instanceof HeartbeatException) {
-          HeartbeatException heartbeatException = (HeartbeatException) cause;
-          String coordinator = Objects.requireNonNull(heartbeatException.getExecutionInfo().getCoordinator()).getEndPoint().toString();
-          System.out.println("Coordinator: " + coordinator);
-        }
+    } catch (ExecutionException ee) {
+      Throwable cause = ee.getCause();
+      if (!(cause instanceof HeartbeatException)) {
+        // HeartbeatException might happen, anything else is unexpected
+        throw cause;
       }
+      HeartbeatException he = (HeartbeatException) cause;
+      String coordinator = Objects.requireNonNull(he.getExecutionInfo().getCoordinator()).getEndPoint().toString();
+      String msg = "Coordinator: " + coordinator;
+      logger.debug(msg);
+      //System.out.println(msg);
+    } catch (Exception e) {
+      // Any other kind of exception is logged immediately (and no other action is taken)
+      String msg = "Unexpected exception occurred when retrieving future: " + e;
+      logger.error(msg, e);
+      //System.out.println(msg);
     }
   }
 
@@ -412,7 +417,9 @@ public class CrossDatacenterFailover {
 
       // No node could be tried, because all nodes in the query plan were down. This could be a
       // total DC outage, so trying another DC makes sense.
-      System.out.println("All nodes were down in this datacenter, failing over");
+      String msg = "All nodes were down in this datacenter, failing over";
+      logger.warn(msg);
+      //System.out.println(msg);
       return true;
 
     } else if (mainException instanceof AllNodesFailedException) {
@@ -430,13 +437,16 @@ public class CrossDatacenterFailover {
         Node coordinator = entry.getKey();
         List<Throwable> errors = entry.getValue();
 
-        System.out.printf(
-                "Node %s in DC %s was tried %d times but failed with:%n",
+        String msg = String.format("Node %s in DC %s was tried %d times but failed with:%n",
                 coordinator.getEndPoint(), coordinator.getDatacenter(), errors.size());
+        logger.warn(msg);
+        //System.out.println(msg);
 
         for (Throwable nodeException : errors) {
 
-          System.out.printf("\t- %s%n", nodeException);
+          String msgNodeException = String.format("\t- %s%n", nodeException);
+          logger.error(msgNodeException);
+          //System.out.println(msgNodeException);
 
           // If the error was a replica availability error, then we know that some replicas were
           // down in this DC. Retrying in another DC could solve the problem. Other errors don't
@@ -450,10 +460,13 @@ public class CrossDatacenterFailover {
       // Authorize the failover if at least one of the coordinators reported a replica availability
       // error that could be solved by trying another DC.
       if (failover) {
-        System.out.println(
-                "Some nodes tried in this DC reported a replica availability error, failing over");
+        String msg = "Some nodes tried in this DC reported a replica availability error, failing over";
+        logger.warn(msg);
+        //System.out.println(msg);
       } else {
-        System.out.println("All nodes tried in this DC failed unexpectedly, not failing over");
+        String msg = "All nodes tried in this DC failed unexpectedly, not failing over";
+        logger.error(msg);
+        //System.out.println(msg);
       }
       return failover;
 
@@ -467,8 +480,9 @@ public class CrossDatacenterFailover {
       // latency for a request is equal or very close to the request timeout, beware that failing
       // over to a different datacenter here could potentially break your SLA.
 
-      System.out.println(
-              "No node in this DC replied before the timeout was triggered, failing over");
+      String msg = "No node in this DC replied before the timeout was triggered, failing over";
+      logger.warn(msg);
+      //System.out.println(msg);
       return true;
 
     } else if (mainException instanceof CoordinatorException) {
@@ -480,16 +494,20 @@ public class CrossDatacenterFailover {
       // replica availability error, we authorize the failover.
 
       Node coordinator = ((CoordinatorException) mainException).getCoordinator();
-      System.out.printf(
-              "Node %s in DC %s was tried once but failed with: %s%n",
+      String msg = String.format("Node %s in DC %s was tried once but failed with: %s%n",
               coordinator.getEndPoint(), coordinator.getDatacenter(), mainException);
+      logger.error(msg);
+      //System.out.println(msg);
 
       boolean failover = isReplicaAvailabilityError(mainException);
       if (failover) {
-        System.out.println(
-                "The only node tried in this DC reported a replica availability error, failing over");
+        String msgFailover = "The only node tried in this DC reported a replica availability error, failing over";
+        logger.warn(msgFailover);
+        //System.out.println(msgFailover);
       } else {
-        System.out.println("The only node tried in this DC failed unexpectedly, not failing over");
+        String msgNoFailover = "The only node tried in this DC failed unexpectedly, not failing over";
+        logger.error(msgNoFailover);
+        //System.out.println(msgNoFailover);
       }
       return failover;
 
@@ -498,14 +516,22 @@ public class CrossDatacenterFailover {
       // The request failed with a rather unusual error. This generally indicates a more serious
       // issue, since the retry policy decided to surface the error immediately. Trying another DC
       // is probably a bad idea.
-      System.out.println("The request failed unexpectedly, not failing over: " + mainException);
+      String msg = "The request failed unexpectedly, not failing over: " + mainException;
+      logger.error(msg, mainException);
+      //System.out.println(msg);
       // DEBUGGING - TODO - REMOVE
-      if (mainException instanceof HeartbeatException) {
-        HeartbeatException heartbeatException = (HeartbeatException) mainException;
-        String coordinator = Objects.requireNonNull(heartbeatException.getExecutionInfo().getCoordinator()).getEndPoint().toString();
-        System.out.println("Coordinator: " + coordinator);
-      }
+      logHeartbeatError(mainException);
       return false;
+    }
+  }
+
+  private void logHeartbeatError(Throwable t) {
+    if (t instanceof HeartbeatException) {
+      HeartbeatException heartbeatException = (HeartbeatException) t;
+      String coordinator = Objects.requireNonNull(heartbeatException.getExecutionInfo().getCoordinator()).getEndPoint().toString();
+      String msg = "Coordinator: " + coordinator;
+      logger.debug(msg);
+      //System.out.println(msg);
     }
   }
 
