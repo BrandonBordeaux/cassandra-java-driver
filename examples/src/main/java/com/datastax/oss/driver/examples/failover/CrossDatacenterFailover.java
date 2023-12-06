@@ -22,7 +22,6 @@ import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.DriverException;
 import com.datastax.oss.driver.api.core.DriverTimeoutException;
 import com.datastax.oss.driver.api.core.NoNodeAvailableException;
-import com.datastax.oss.driver.api.core.connection.HeartbeatException;
 import com.datastax.oss.driver.api.core.cql.AsyncResultSet;
 import com.datastax.oss.driver.api.core.cql.SimpleStatement;
 import com.datastax.oss.driver.api.core.cql.Statement;
@@ -40,7 +39,6 @@ import java.util.*;
 import java.util.Map.Entry;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
-import java.util.concurrent.ExecutionException;
 
 /**
  * This example illustrates how to implement a cross-datacenter failover strategy from application
@@ -62,7 +60,7 @@ import java.util.concurrent.ExecutionException;
  *
  * <ol>
  *   <li>Synchronous: see the {@link #writeSync(Statement)} method below;
- *   <li>Asynchronous: see the {@link #writeAsync(Statement, int)} method below;
+ *   <li>Asynchronous: see the {@link #writeAsync(Statement)} method below;
  * </ol>
  * <p>
  * The 2 styles are identical in terms of failover effect; they are all included merely to help
@@ -115,15 +113,15 @@ public class CrossDatacenterFailover {
                       + "'2018-02-26T13:53:46.345+01:00',"
                       + "2.34)");
 
-      int numberOfWrites = Integer.parseInt(client.config.get("num_writes"));
-      for (int i = 0; i < numberOfWrites; i++) {
+      long numberOfWrites = Long.parseLong(client.config.get("num_writes"));
+      for (long i = 0; i < numberOfWrites; i++) {
 
         //client.writeSync(statement);
-        client.writeAsync(statement, i);
+        client.writeAsync(statement);
       }
 
     } catch (Throwable e) {
-      throw new RuntimeException(e);
+      client.logger.error("Unknown error occurred", e);
     } finally {
       client.close();
     }
@@ -299,7 +297,7 @@ public class CrossDatacenterFailover {
   /**
    * Inserts data asynchronously using the local DC, retrying if necessary in a remote DC.
    */
-  private void writeAsync(Statement<?> statement, int iteratorCount) throws Throwable {
+  private void writeAsync(Statement<?> statement) throws Throwable {
 
     //System.out.println("------- DC failover (async) ------- ");
 
@@ -333,18 +331,14 @@ public class CrossDatacenterFailover {
                       .whenComplete(
                               (rs, error) -> {
                                 if (error == null) {
-                                  if (iteratorCount % 100 == 0) {
-                                    String msg = "Write succeeded";
-                                    logger.debug(msg);
-                                    //System.out.println(msg);
-                                  }
+                                  String msg = "Write succeeded";
+                                  logger.debug(msg);
+                                  //System.out.println(msg);
                                 } else {
-                                  String msg = "Write failed in remote DC";
+                                  String msg = "Write failed";
                                   logger.error(msg, error);
                                   //System.out.println(msg);
                                   //error.printStackTrace();
-                                  // DEBUGGING - TODO - REMOVE
-                                  logHeartbeatError(error);
                                 }
                               });
     } else {
@@ -354,18 +348,14 @@ public class CrossDatacenterFailover {
                       .whenComplete(
                               (rs, error) -> {
                                 if (error == null) {
-                                  if (iteratorCount % 100 == 0) {
-                                    String msg = "Write succeeded";
-                                    logger.debug(msg);
-                                    //System.out.println(msg);
-                                  }
+                                  String msg = "Write succeeded";
+                                  logger.debug(msg);
+                                  //System.out.println(msg);
                                 } else {
                                   String msg = "Primary session is null, write failed in remote DC";
                                   logger.error(msg, error);
                                   //System.out.println(msg);
                                   //error.printStackTrace();
-                                  // DEBUGGING - TODO - REMOVE
-                                  logHeartbeatError(error);
                                 }
                               });
     }
@@ -373,17 +363,6 @@ public class CrossDatacenterFailover {
     // for the sake of this example, wait for the operation to finish
     try {
       result.toCompletableFuture().get();
-    } catch (ExecutionException ee) {
-      Throwable cause = ee.getCause();
-      if (!(cause instanceof HeartbeatException)) {
-        // HeartbeatException might happen, anything else is unexpected
-        throw cause;
-      }
-      HeartbeatException he = (HeartbeatException) cause;
-      String coordinator = Objects.requireNonNull(he.getExecutionInfo().getCoordinator()).getEndPoint().toString();
-      String msg = "Coordinator: " + coordinator;
-      logger.debug(msg);
-      //System.out.println(msg);
     } catch (Exception e) {
       // Any other kind of exception is logged immediately (and no other action is taken)
       String msg = "Unexpected exception occurred when retrieving future: " + e;
@@ -519,19 +498,7 @@ public class CrossDatacenterFailover {
       String msg = "The request failed unexpectedly, not failing over: " + mainException;
       logger.error(msg, mainException);
       //System.out.println(msg);
-      // DEBUGGING - TODO - REMOVE
-      logHeartbeatError(mainException);
       return false;
-    }
-  }
-
-  private void logHeartbeatError(Throwable t) {
-    if (t instanceof HeartbeatException) {
-      HeartbeatException heartbeatException = (HeartbeatException) t;
-      String coordinator = Objects.requireNonNull(heartbeatException.getExecutionInfo().getCoordinator()).getEndPoint().toString();
-      String msg = "Coordinator: " + coordinator;
-      logger.debug(msg);
-      //System.out.println(msg);
     }
   }
 
