@@ -17,15 +17,11 @@
  */
 package com.datastax.oss.driver.examples.failover;
 
-import com.datastax.dse.driver.api.core.cql.reactive.ReactiveRow;
 import com.datastax.oss.driver.api.core.AllNodesFailedException;
 import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.DriverException;
 import com.datastax.oss.driver.api.core.DriverTimeoutException;
 import com.datastax.oss.driver.api.core.NoNodeAvailableException;
-import com.datastax.oss.driver.api.core.config.DriverConfigLoader;
-import com.datastax.oss.driver.api.core.config.OptionsMap;
-import com.datastax.oss.driver.api.core.config.TypedDriverOption;
 import com.datastax.oss.driver.api.core.cql.AsyncResultSet;
 import com.datastax.oss.driver.api.core.cql.SimpleStatement;
 import com.datastax.oss.driver.api.core.cql.Statement;
@@ -34,13 +30,15 @@ import com.datastax.oss.driver.api.core.servererrors.CoordinatorException;
 import com.datastax.oss.driver.api.core.servererrors.QueryConsistencyException;
 import com.datastax.oss.driver.api.core.servererrors.UnavailableException;
 import com.datastax.oss.driver.internal.core.util.concurrent.CompletableFutures;
-import java.util.Collections;
-import java.util.List;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+import java.nio.file.Paths;
+import java.util.*;
 import java.util.Map.Entry;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
-import java.util.concurrent.ExecutionException;
-import reactor.core.publisher.Flux;
 
 /**
  * This example illustrates how to implement a cross-datacenter failover strategy from application
@@ -58,16 +56,14 @@ import reactor.core.publisher.Flux;
  * the {@link #shouldFailover(DriverException)} method below; study it carefully and adapt it to
  * your needs if necessary.
  *
- * <p>The actual request execution and failover code is presented in 3 different programming styles:
+ * <p>The actual request execution and failover code is presented in 2 different programming styles:
  *
  * <ol>
- *   <li>Synchronous: see the {@link #writeSync()} method below;
- *   <li>Asynchronous: see the {@link #writeAsync()} method below;
- *   <li>Reactive (using <a href="https://projectreactor.io/">Reactor</a>): see the {@link
- *       #writeReactive()} method below.
+ *   <li>Synchronous: see the {@link #writeSync(Statement)} method below;
+ *   <li>Asynchronous: see the {@link #writeAsync(Statement)} method below;
  * </ol>
- *
- * The 3 styles are identical in terms of failover effect; they are all included merely to help
+ * <p>
+ * The 2 styles are identical in terms of failover effect; they are all included merely to help
  * programmers pick the variant that is closest to the style they use.
  *
  * <p>Preconditions:
@@ -81,16 +77,14 @@ import reactor.core.publisher.Flux;
  * <p>Side effects:
  *
  * <ol>
- *   <li>Creates a new keyspace {@code failover} in the cluster, with replication factor 3 in both
- *       datacenters. If a keyspace with this name already exists, it will be reused;
- *   <li>Creates a new table {@code failover.orders}. If a table with that name exists already, it
+ *   <li>Creates a new table {@code testks.orders}. If a table with that name exists already, it
  *       will be reused;
  *   <li>Tries to write a row in the table using the local datacenter dc1;
  *   <li>If the local datacenter dc1 is down, retries the write in the remote datacenter dc2.
  * </ol>
  *
  * @see <a href="https://docs.datastax.com/en/developer/java-driver/latest">Java Driver online
- *     manual</a>
+ * manual</a>
  */
 public class CrossDatacenterFailover {
 
@@ -103,6 +97,7 @@ public class CrossDatacenterFailover {
       // Note: when this example is executed, at least the local DC must be available
       // since the driver will try to reach contact points in that DC.
 
+      client.createConfig();
       client.connect();
       client.createSchema();
 
@@ -110,206 +105,270 @@ public class CrossDatacenterFailover {
       // the writes executed below will first fail in dc1, then be diverted to dc2, where they will
       // succeed.
 
-      client.writeSync();
-      client.writeAsync();
-      client.writeReactive();
+      Statement<?> statement = SimpleStatement.newInstance(
+              "INSERT INTO testks.orders "
+                      + "(product_id, timestamp, price) "
+                      + "VALUES ("
+                      + "756716f7-2e54-4715-9f00-91dcbea6cf50,"
+                      + "'2018-02-26T13:53:46.345+01:00',"
+                      + "2.34)");
 
+      long numberOfWrites = Long.parseLong(client.config.get("num_writes"));
+      for (long i = 0; i < numberOfWrites; i++) {
+
+        //client.writeSync(statement);
+        client.writeAsync(statement);
+      }
+
+    } catch (Throwable e) {
+      client.logger.error("Unknown error occurred", e);
     } finally {
       client.close();
     }
   }
 
-  private CqlSession session;
+  private Logger logger;
+  private CqlSession primarySession;
+  private CqlSession secondarySession;
+  private Map<String, String> config;
 
-  private CrossDatacenterFailover() {}
-
-  /** Initiates a connection to the cluster. */
-  private void connect() {
-
-    // For simplicity, this example uses a 100% in-memory configuration loader, but the same
-    // configuration can be achieved with the more traditional file-based approach.
-    // Simply put the below snippet in your application.conf file to get the same config:
-
-    /*
-    datastax-java-driver {
-      basic.contact-points = [ "127.0.0.1:9042" ]
-      basic.load-balancing-policy.local-datacenter = "dc1"
-      basic.request.consistency = LOCAL_QUORUM
-      profiles {
-        remote {
-          basic.load-balancing-policy.local-datacenter = "dc2"
-          basic.request.consistency = LOCAL_ONE
-        }
-      }
-    }
-    */
-
-    OptionsMap options = OptionsMap.driverDefaults();
-    // set the datacenter to dc1 in the default profile; this makes dc1 the local datacenter
-    options.put(TypedDriverOption.LOAD_BALANCING_LOCAL_DATACENTER, "dc1");
-    // set the datacenter to dc2 in the "remote" profile
-    options.put("remote", TypedDriverOption.LOAD_BALANCING_LOCAL_DATACENTER, "dc2");
-    // make sure to provide a contact point belonging to dc1, not dc2!
-    options.put(TypedDriverOption.CONTACT_POINTS, Collections.singletonList("127.0.0.1:9042"));
-    // in this example, the default consistency level is LOCAL_QUORUM
-    options.put(TypedDriverOption.REQUEST_CONSISTENCY, "LOCAL_QUORUM");
-    // but when failing over, the consistency level will be automatically downgraded to LOCAL_ONE
-    options.put("remote", TypedDriverOption.REQUEST_CONSISTENCY, "LOCAL_ONE");
-
-    session = CqlSession.builder().withConfigLoader(DriverConfigLoader.fromMap(options)).build();
-
-    System.out.println("Connected to cluster with session: " + session.getName());
+  private CrossDatacenterFailover() {
+    logger = LoggerFactory.getLogger(CrossDatacenterFailover.class);
   }
 
-  /** Creates the schema (keyspace) and table for this example. */
+  private void createConfig() {
+
+    config = new HashMap<>();
+    config.put("primarySCB", System.getProperty("primarySCB", null));
+    config.put("secondarySCB", System.getProperty("secondarySCB", null));
+    config.put("keyspace", System.getProperty("keyspace", null));
+    config.put("user", System.getProperty("user", null));
+    config.put("password", System.getProperty("password", null));
+    // For testing
+    config.put("num_writes", System.getProperty("num_writes", "1"));
+
+    StringBuilder missing = new StringBuilder();
+    for (Map.Entry<String, String> entry : config.entrySet()) {
+      if (entry.getValue() == null) {
+        missing.append("-D").append(entry.getKey()).append(", ");
+      }
+    }
+
+    if (missing.length() > 0) {
+      System.out.println("The following properties are missing: " + missing);
+      System.exit(1);
+    }
+  }
+
+  private CqlSession createSession(String scb) {
+    return CqlSession.builder()
+            .withCloudSecureConnectBundle(Paths.get(scb))
+            .withAuthCredentials(config.get("user"), config.get("password"))
+            .withKeyspace(config.get("keyspace"))
+            .build();
+  }
+
+  /**
+   * Initiates a connection to the cluster.
+   */
+  private void connect() {
+
+    try {
+
+      primarySession = createSession(config.get("primarySCB"));
+      String msg = "Connected to cluster with session: " + primarySession.getName();
+      logger.info(msg);
+      //System.out.println(msg);
+
+    } catch (AllNodesFailedException | IllegalStateException e) {
+
+      String msg = "Error connecting to primary session: " + e;
+      logger.error(msg);
+      //System.out.println(msg);
+      primarySession = null;
+    }
+
+    try {
+
+      secondarySession = createSession(config.get("secondarySCB"));
+      String msg = "Connected to cluster with session: " + secondarySession.getName();
+      logger.info(msg);
+      //System.out.println(msg);
+
+    } catch (AllNodesFailedException | IllegalStateException e) {
+
+      String msg = "Error connecting to secondary session: " + e;
+      logger.error(msg);
+      //System.out.println(msg);
+      secondarySession = null;
+    }
+
+    if (primarySession == null && secondarySession == null) {
+
+      String msg = "Unable to connect to any session, exiting...";
+      logger.error(msg);
+      //System.out.println(msg);
+      System.exit(1);
+    }
+  }
+
+  /**
+   * Creates the schema (keyspace) and table for this example.
+   */
   private void createSchema() {
 
-    session.execute(
-        "CREATE KEYSPACE IF NOT EXISTS failover WITH replication "
-            + "= {'class':'NetworkTopologyStrategy', 'dc1':3, 'dc2':3}");
-
-    session.execute(
-        "CREATE TABLE IF NOT EXISTS failover.orders ("
+    String statement = "CREATE TABLE IF NOT EXISTS testks.orders ("
             + "product_id uuid,"
             + "timestamp timestamp,"
             + "price double,"
             + "PRIMARY KEY (product_id,timestamp)"
-            + ")");
-  }
-
-  /** Inserts data synchronously using the local DC, retrying if necessary in a remote DC. */
-  private void writeSync() {
-
-    System.out.println("------- DC failover (sync) ------- ");
-
-    Statement<?> statement =
-        SimpleStatement.newInstance(
-            "INSERT INTO failover.orders "
-                + "(product_id, timestamp, price) "
-                + "VALUES ("
-                + "756716f7-2e54-4715-9f00-91dcbea6cf50,"
-                + "'2018-02-26T13:53:46.345+01:00',"
-                + "2.34)");
+            + ")";
 
     try {
 
-      // try the statement using the default profile, which targets the local datacenter dc1.
-      session.execute(statement);
+      primarySession.execute(statement);
 
-      System.out.println("Write succeeded");
+    } catch (Exception e) {
+
+      String msgPrimary = "Error creating schema, retrying with remote DC";
+      logger.warn(msgPrimary);
+      //System.out.println(msgPrimary);
+
+      try {
+
+        secondarySession.execute(statement);
+
+      } catch (Exception e2) {
+
+        String msgSecondary = "Error creating schema in remote DC";
+        logger.error(msgSecondary, e2);
+        //System.out.println(msgSecondary);
+        //e2.printStackTrace();
+      }
+
+    }
+  }
+
+  /**
+   * Inserts data synchronously using the local DC, retrying if necessary in a remote DC.
+   */
+  private void writeSync(Statement<?> statement) {
+
+    //System.out.println("------- DC failover (sync) ------- ");
+
+    try {
+
+      // try the statement using the default profile, which targets the local datacenter.
+      primarySession.execute(statement);
+
+      String msgLocalSuccess = "Write to local DC succeeded";
+      logger.debug(msgLocalSuccess);
+      //System.out.println(msgLocalSuccess);
 
     } catch (DriverException e) {
 
       if (shouldFailover(e)) {
 
-        System.out.println("Write failed in local DC, retrying in remote DC");
+        String msgLocalFail = "Write failed in local DC, retrying in remote DC";
+        logger.warn(msgLocalFail);
+        //System.out.println(msgLocalFail);
 
         try {
 
-          // try the statement using the remote profile, which targets the remote datacenter dc2.
-          session.execute(statement.setExecutionProfileName("remote"));
+          // try the statement using the secondary session, which targets the remote datacenter.
+          secondarySession.execute(statement);
 
-          System.out.println("Write succeeded");
+          String msgRemoteSuccess = "Write to remote DC succeeded";
+          logger.debug(msgRemoteSuccess);
+          //System.out.println(msgRemoteSuccess);
 
         } catch (DriverException e2) {
 
-          System.out.println("Write failed in remote DC");
-
-          e2.printStackTrace();
+          String msgRemoteFail = "Write failed in remote DC";
+          logger.error(msgRemoteFail, e2);
+          //System.out.println(msgRemoteFail);
+          //e2.printStackTrace();
         }
       }
     }
     // let other errors propagate
   }
 
-  /** Inserts data asynchronously using the local DC, retrying if necessary in a remote DC. */
-  private void writeAsync() throws ExecutionException, InterruptedException {
+  /**
+   * Inserts data asynchronously using the local DC, retrying if necessary in a remote DC.
+   */
+  private void writeAsync(Statement<?> statement) throws Throwable {
 
-    System.out.println("------- DC failover (async) ------- ");
+    //System.out.println("------- DC failover (async) ------- ");
 
-    Statement<?> statement =
-        SimpleStatement.newInstance(
-            "INSERT INTO failover.orders "
-                + "(product_id, timestamp, price) "
-                + "VALUES ("
-                + "756716f7-2e54-4715-9f00-91dcbea6cf50,"
-                + "'2018-02-26T13:53:46.345+01:00',"
-                + "2.34)");
+    CompletionStage<AsyncResultSet> result;
 
-    CompletionStage<AsyncResultSet> result =
-        // try the statement using the default profile, which targets the local datacenter dc1.
-        session
-            .executeAsync(statement)
-            .handle(
-                (rs, error) -> {
-                  if (error == null) {
-                    return CompletableFuture.completedFuture(rs);
-                  } else {
-                    if (error instanceof DriverException
-                        && shouldFailover((DriverException) error)) {
-                      System.out.println("Write failed in local DC, retrying in remote DC");
-                      // try the statement using the remote profile, which targets the remote
-                      // datacenter dc2.
-                      return session.executeAsync(statement.setExecutionProfileName("remote"));
-                    }
-                    // let other errors propagate
-                    return CompletableFutures.<AsyncResultSet>failedFuture(error);
-                  }
-                })
-            // unwrap (flatmap) the nested future
-            .thenCompose(future -> future)
-            .whenComplete(
-                (rs, error) -> {
-                  if (error == null) {
-                    System.out.println("Write succeeded");
-                  } else {
-                    System.out.println("Write failed in remote DC");
-                    error.printStackTrace();
-                  }
-                });
-
-    // for the sake of this example, wait for the operation to finish
-    result.toCompletableFuture().get();
-  }
-
-  /** Inserts data reactively using the local DC, retrying if necessary in a remote DC. */
-  private void writeReactive() {
-
-    System.out.println("------- DC failover (reactive) ------- ");
-
-    Statement<?> statement =
-        SimpleStatement.newInstance(
-            "INSERT INTO failover.orders "
-                + "(product_id, timestamp, price) "
-                + "VALUES ("
-                + "756716f7-2e54-4715-9f00-91dcbea6cf50,"
-                + "'2018-02-26T13:53:46.345+01:00',"
-                + "2.34)");
-
-    Flux<ReactiveRow> result =
-        // try the statement using the default profile, which targets the local datacenter dc1.
-        Flux.from(session.executeReactive(statement))
-            .onErrorResume(
-                DriverException.class,
-                error -> {
-                  if (shouldFailover(error)) {
-                    System.out.println("Write failed in local DC, retrying in remote DC");
-                    // try the statement using the remote profile, which targets the remote
-                    // datacenter dc2.
-                    return session.executeReactive(statement.setExecutionProfileName("remote"));
-                  } else {
-                    return Flux.error(error);
-                  }
-                })
-            .doOnComplete(() -> System.out.println("Write succeeded"))
-            .doOnError(
-                error -> {
-                  System.out.println("Write failed");
-                  error.printStackTrace();
-                });
+    if (primarySession != null) {
+      result =
+              // try the statement using the primary session, which targets the local datacenter.
+              primarySession
+                      .executeAsync(statement)
+                      .handle(
+                              (rs, error) -> {
+                                if (error == null) {
+                                  return CompletableFuture.completedFuture(rs);
+                                } else {
+                                  if (error instanceof DriverException
+                                          && shouldFailover((DriverException) error)) {
+                                    String msg = "Write failed in local DC, retrying in remote DC";
+                                    logger.warn(msg);
+                                    //System.out.println(msg);
+                                    // try the statement using the secondary session, which targets the remote
+                                    // datacenter.
+                                    return secondarySession.executeAsync(statement);
+                                  }
+                                  // let other errors propagate
+                                  return CompletableFutures.<AsyncResultSet>failedFuture(error);
+                                }
+                              })
+                      // unwrap (flatmap) the nested future
+                      .thenCompose(future -> future)
+                      .whenComplete(
+                              (rs, error) -> {
+                                if (error == null) {
+                                  String msg = "Write succeeded";
+                                  logger.debug(msg);
+                                  //System.out.println(msg);
+                                } else {
+                                  String msg = "Write failed";
+                                  logger.error(msg, error);
+                                  //System.out.println(msg);
+                                  //error.printStackTrace();
+                                }
+                              });
+    } else {
+      result =
+              secondarySession
+                      .executeAsync(statement)
+                      .whenComplete(
+                              (rs, error) -> {
+                                if (error == null) {
+                                  String msg = "Write succeeded";
+                                  logger.debug(msg);
+                                  //System.out.println(msg);
+                                } else {
+                                  String msg = "Primary session is null, write failed in remote DC";
+                                  logger.error(msg, error);
+                                  //System.out.println(msg);
+                                  //error.printStackTrace();
+                                }
+                              });
+    }
 
     // for the sake of this example, wait for the operation to finish
-    result.blockLast();
+    try {
+      result.toCompletableFuture().get();
+    } catch (Exception e) {
+      // Any other kind of exception is logged immediately (and no other action is taken)
+      String msg = "Unexpected exception occurred when retrieving future: " + e;
+      logger.error(msg, e);
+      //System.out.println(msg);
+    }
   }
 
   /**
@@ -324,7 +383,7 @@ public class CrossDatacenterFailover {
    *   <li>DC unreachable: one or many nodes were queried, but none responded (timeout);
    *   <li>Other errors.
    * </ol>
-   *
+   * <p>
    * A DC failover is authorized for the first three groups above: total DC outage, partial DC
    * outage, and DC unreachable.
    *
@@ -337,7 +396,9 @@ public class CrossDatacenterFailover {
 
       // No node could be tried, because all nodes in the query plan were down. This could be a
       // total DC outage, so trying another DC makes sense.
-      System.out.println("All nodes were down in this datacenter, failing over");
+      String msg = "All nodes were down in this datacenter, failing over";
+      logger.warn(msg);
+      //System.out.println(msg);
       return true;
 
     } else if (mainException instanceof AllNodesFailedException) {
@@ -350,18 +411,21 @@ public class CrossDatacenterFailover {
       // Inspect the error to find out how many coordinators were tried, and which errors they
       // returned.
       for (Entry<Node, List<Throwable>> entry :
-          ((AllNodesFailedException) mainException).getAllErrors().entrySet()) {
+              ((AllNodesFailedException) mainException).getAllErrors().entrySet()) {
 
         Node coordinator = entry.getKey();
         List<Throwable> errors = entry.getValue();
 
-        System.out.printf(
-            "Node %s in DC %s was tried %d times but failed with:%n",
-            coordinator.getEndPoint(), coordinator.getDatacenter(), errors.size());
+        String msg = String.format("Node %s in DC %s was tried %d times but failed with:%n",
+                coordinator.getEndPoint(), coordinator.getDatacenter(), errors.size());
+        logger.warn(msg);
+        //System.out.println(msg);
 
         for (Throwable nodeException : errors) {
 
-          System.out.printf("\t- %s%n", nodeException);
+          String msgNodeException = String.format("\t- %s%n", nodeException);
+          logger.error(msgNodeException);
+          //System.out.println(msgNodeException);
 
           // If the error was a replica availability error, then we know that some replicas were
           // down in this DC. Retrying in another DC could solve the problem. Other errors don't
@@ -375,10 +439,13 @@ public class CrossDatacenterFailover {
       // Authorize the failover if at least one of the coordinators reported a replica availability
       // error that could be solved by trying another DC.
       if (failover) {
-        System.out.println(
-            "Some nodes tried in this DC reported a replica availability error, failing over");
+        String msg = "Some nodes tried in this DC reported a replica availability error, failing over";
+        logger.warn(msg);
+        //System.out.println(msg);
       } else {
-        System.out.println("All nodes tried in this DC failed unexpectedly, not failing over");
+        String msg = "All nodes tried in this DC failed unexpectedly, not failing over";
+        logger.error(msg);
+        //System.out.println(msg);
       }
       return failover;
 
@@ -392,8 +459,9 @@ public class CrossDatacenterFailover {
       // latency for a request is equal or very close to the request timeout, beware that failing
       // over to a different datacenter here could potentially break your SLA.
 
-      System.out.println(
-          "No node in this DC replied before the timeout was triggered, failing over");
+      String msg = "No node in this DC replied before the timeout was triggered, failing over";
+      logger.warn(msg);
+      //System.out.println(msg);
       return true;
 
     } else if (mainException instanceof CoordinatorException) {
@@ -405,16 +473,20 @@ public class CrossDatacenterFailover {
       // replica availability error, we authorize the failover.
 
       Node coordinator = ((CoordinatorException) mainException).getCoordinator();
-      System.out.printf(
-          "Node %s in DC %s was tried once but failed with: %s%n",
-          coordinator.getEndPoint(), coordinator.getDatacenter(), mainException);
+      String msg = String.format("Node %s in DC %s was tried once but failed with: %s%n",
+              coordinator.getEndPoint(), coordinator.getDatacenter(), mainException);
+      logger.error(msg);
+      //System.out.println(msg);
 
       boolean failover = isReplicaAvailabilityError(mainException);
       if (failover) {
-        System.out.println(
-            "The only node tried in this DC reported a replica availability error, failing over");
+        String msgFailover = "The only node tried in this DC reported a replica availability error, failing over";
+        logger.warn(msgFailover);
+        //System.out.println(msgFailover);
       } else {
-        System.out.println("The only node tried in this DC failed unexpectedly, not failing over");
+        String msgNoFailover = "The only node tried in this DC failed unexpectedly, not failing over";
+        logger.error(msgNoFailover);
+        //System.out.println(msgNoFailover);
       }
       return failover;
 
@@ -423,7 +495,9 @@ public class CrossDatacenterFailover {
       // The request failed with a rather unusual error. This generally indicates a more serious
       // issue, since the retry policy decided to surface the error immediately. Trying another DC
       // is probably a bad idea.
-      System.out.println("The request failed unexpectedly, not failing over: " + mainException);
+      String msg = "The request failed unexpectedly, not failing over: " + mainException;
+      logger.error(msg, mainException);
+      //System.out.println(msg);
       return false;
     }
   }
@@ -442,7 +516,7 @@ public class CrossDatacenterFailover {
    *   <li>if the initial consistency level can be downgraded, then retrying again may succeed (in
    *       the same DC, or in another one).
    * </ol>
-   *
+   * <p>
    * In this example both conditions above apply, so we authorize the failover whenever we detect a
    * replica availability error.
    */
@@ -451,8 +525,12 @@ public class CrossDatacenterFailover {
   }
 
   private void close() {
-    if (session != null) {
-      session.close();
+    if (primarySession != null) {
+      primarySession.close();
+    }
+
+    if (secondarySession != null) {
+      secondarySession.close();
     }
   }
 }
